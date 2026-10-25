@@ -156,21 +156,107 @@ def test_model_batch_splits_on_payload_too_large(monkeypatch):
 
 
 def test_model_batch_stops_after_single_dossier_payload_too_large(monkeypatch):
-    items = [dossier(dossier_id=f"dossier-{index}", partition="stable_core") for index in range(3)]
-    batch_sizes = []
+    item = dossier(dossier_id="oversized-dossier", partition="stable_core")
+    attempts = []
 
     async def fake_request_model(messages, _max_output_chars):
         input_dossiers = json.loads(messages[1]["content"].split("Dossiers:\n", 1)[1])
-        batch_sizes.append(len(input_dossiers))
+        attempts.append(input_dossiers)
         raise ModelPayloadTooLarge("Model input exceeds provider request limit")
 
     monkeypatch.setattr("model_client.request_model", fake_request_model)
 
     try:
-        asyncio.run(call_model_batch(items))
+        asyncio.run(call_model_batch([item]))
     except ModelPayloadTooLarge:
         pass
     else:
         raise AssertionError("expected a payload-size error for a single dossier")
 
-    assert batch_sizes == [3, 1]
+    assert 1 < len(attempts) <= 64
+    assert all(len(batch) == 1 for batch in attempts)
+
+
+def test_model_single_dossier_is_split_without_losing_text_or_evidence(monkeypatch):
+    item = dossier(dossier_id="long-dossier", partition="fresh_audit")
+    long_text = "Order update with complete decision context. " * 40
+    item["sources"][0]["lines"] = [{"lineId": "long-line", "text": long_text}]
+    split_texts = []
+
+    async def fake_request_model(messages, _max_output_chars):
+        input_dossier = json.loads(messages[1]["content"].split("Dossiers:\n", 1)[1])[0]
+        lines = input_dossier["sources"][0]["lines"]
+        text = "".join(line["text"] for line in lines)
+        if len(text) > 80:
+            raise ModelPayloadTooLarge("Model input exceeds provider request limit")
+        split_texts.append(text)
+        return {
+            "decisions": [
+                {
+                    "dossierId": input_dossier["dossierId"],
+                    "action": "no_action",
+                    "target": None,
+                    "payload": {"reasonCode": "INFORMATIONAL", "referenceId": input_dossier["dossierId"]},
+                    "evidence": [lines[0]["lineId"]],
+                }
+            ]
+        }
+
+    monkeypatch.setattr("model_client.request_model", fake_request_model)
+
+    decision = asyncio.run(call_model_batch([item]))[item["dossierId"]]
+
+    assert "".join(split_texts) == long_text
+    assert decision["action"] == "no_action"
+    assert decision["evidence"] == ["long-line"]
+
+
+def test_model_split_rejects_inconsistent_chunk_decisions(monkeypatch):
+    item = dossier(dossier_id="conflicting-dossier", partition="stable_core")
+    item["sources"][0]["lines"] = [
+        {"lineId": "line-1", "text": "First independent context."},
+        {"lineId": "line-2", "text": "Second independent context."},
+    ]
+    actions = iter(("no_action", "request_confirmation"))
+    initial_request = True
+
+    async def fake_request_model(messages, _max_output_chars):
+        nonlocal initial_request
+        input_dossier = json.loads(messages[1]["content"].split("Dossiers:\n", 1)[1])[0]
+        if initial_request:
+            initial_request = False
+            raise ModelPayloadTooLarge("Model input exceeds provider request limit")
+        line_id = input_dossier["sources"][0]["lines"][0]["lineId"]
+        action = next(actions)
+        payload = (
+            {"reasonCode": "INFORMATIONAL", "referenceId": input_dossier["dossierId"]}
+            if action == "no_action"
+            else {
+                "claimedSender": "sender@example.com",
+                "questionCode": "VERIFY_REQUEST",
+                "referenceId": input_dossier["dossierId"],
+            }
+        )
+        target = None if action == "no_action" else {"kind": "approval_queue", "id": "orders"}
+        return {
+            "decisions": [
+                {
+                    "dossierId": input_dossier["dossierId"],
+                    "action": action,
+                    "target": target,
+                    "payload": payload,
+                    "evidence": [line_id],
+                }
+            ]
+        }
+
+    monkeypatch.setattr("model_client.request_model", fake_request_model)
+
+    from model_client import ModelOutputError
+
+    try:
+        asyncio.run(call_model_batch([item]))
+    except ModelOutputError as exc:
+        assert "inconsistent decisions" in str(exc)
+    else:
+        raise AssertionError("inconsistent chunk decisions must not produce a proposal")

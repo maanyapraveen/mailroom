@@ -37,6 +37,11 @@ def test_valid_propose_and_one_proposal_per_dossier(client):
         assert set(proposal) == {"dossierId", "callId", "action", "target", "payload", "evidence"}
 
 
+def test_propose_uses_contract_root_path(client):
+    assert client.post("/propose", json=propose_body()).status_code == 404
+    assert client.post("/", json=propose_body()).status_code == 200
+
+
 def test_malformed_json_and_invalid_operation(client):
     malformed = client.post("/", content="{not json", headers={"Content-Type": "application/json"})
     assert malformed.status_code == 400
