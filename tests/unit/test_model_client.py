@@ -1,10 +1,23 @@
 import asyncio
 import json
+import logging
 
 import httpx
+import pytest
 
 from model_client import ModelPayloadTooLarge, call_model_batch, model_prompt, request_model
 from tests.helpers import dossier
+
+
+def _mock_transport(monkeypatch, handler):
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def wrapper(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", wrapper)
 
 
 def test_model_retries_rate_limit(monkeypatch):
@@ -23,14 +36,7 @@ def test_model_retries_rate_limit(monkeypatch):
             json={"choices": [{"message": {"content": json.dumps({"ok": True})}}]},
         )
 
-    transport = httpx.MockTransport(handler)
-    real_client = httpx.AsyncClient
-
-    def wrapper(*args, **kwargs):
-        kwargs["transport"] = transport
-        return real_client(*args, **kwargs)
-
-    monkeypatch.setattr(httpx, "AsyncClient", wrapper)
+    _mock_transport(monkeypatch, handler)
     result = asyncio.run(request_model([{"role": "user", "content": "hi"}], 1000))
     assert result == {"ok": True}
     assert states["n"] == 2
@@ -46,14 +52,7 @@ def test_model_payload_too_large_is_not_retried(monkeypatch):
         states["n"] += 1
         return httpx.Response(413, request=request)
 
-    transport = httpx.MockTransport(handler)
-    real_client = httpx.AsyncClient
-
-    def wrapper(*args, **kwargs):
-        kwargs["transport"] = transport
-        return real_client(*args, **kwargs)
-
-    monkeypatch.setattr(httpx, "AsyncClient", wrapper)
+    _mock_transport(monkeypatch, handler)
     try:
         asyncio.run(request_model([{"role": "user", "content": "too large"}], 1000))
     except ModelPayloadTooLarge as exc:
@@ -73,14 +72,7 @@ def test_model_timeout_exhausted(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.TimeoutException("timeout")
 
-    transport = httpx.MockTransport(handler)
-    real_client = httpx.AsyncClient
-
-    def wrapper(*args, **kwargs):
-        kwargs["transport"] = transport
-        return real_client(*args, **kwargs)
-
-    monkeypatch.setattr(httpx, "AsyncClient", wrapper)
+    _mock_transport(monkeypatch, handler)
     try:
         asyncio.run(request_model([{"role": "user", "content": "hi"}], 1000, attempts=2))
         raise AssertionError("expected timeout")
@@ -97,6 +89,111 @@ def test_missing_model_config_error(monkeypatch):
         raise AssertionError("expected configuration error")
     except RuntimeError as exc:
         assert "Model configuration missing" in str(exc)
+
+
+def test_gemini_endpoint_model_and_environment_key_are_used_without_logging(monkeypatch, caplog):
+    secret = "test-gemini-key-do-not-log"
+    monkeypatch.setenv("MODEL_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+    monkeypatch.setenv("MODEL_NAME", "gemini-2.5-flash")
+    monkeypatch.setenv("MODEL_API_KEY", secret)
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok":true}'}}]},
+        )
+
+    _mock_transport(monkeypatch, handler)
+    caplog.set_level(logging.WARNING)
+
+    assert asyncio.run(request_model([{"role": "user", "content": "ping"}], 1000)) == {"ok": True}
+    assert len(requests) == 1
+    request = requests[0]
+    assert str(request.url) == (
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    )
+    assert request.headers["Authorization"] == f"Bearer {secret}"
+    payload = json.loads(request.content)
+    assert payload["model"] == "gemini-2.5-flash"
+    assert payload["response_format"] == {"type": "json_object"}
+    assert secret not in caplog.text
+
+
+def test_gemini_provider_error_is_safe_and_not_retried(monkeypatch, caplog):
+    secret = "test-gemini-key-do-not-log"
+    monkeypatch.setenv("MODEL_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+    monkeypatch.setenv("MODEL_NAME", "gemini-2.5-flash")
+    monkeypatch.setenv("MODEL_API_KEY", secret)
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            401,
+            request=request,
+            json={"error": {"message": secret}},
+        )
+
+    _mock_transport(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        asyncio.run(request_model([{"role": "user", "content": "ping"}], 1000))
+
+    assert error.value.response.status_code == 401
+    assert len(requests) == 1
+    assert secret not in str(error.value)
+    assert secret not in caplog.text
+
+
+def test_gemini_malformed_response_fails_safely(monkeypatch):
+    secret = "test-gemini-key-do-not-log"
+    monkeypatch.setenv("MODEL_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+    monkeypatch.setenv("MODEL_NAME", "gemini-2.5-flash")
+    monkeypatch.setenv("MODEL_API_KEY", secret)
+
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "{invalid-json"}}]},
+        )
+
+    _mock_transport(monkeypatch, handler)
+
+    with pytest.raises(RuntimeError, match="Model returned malformed output") as error:
+        asyncio.run(request_model([{"role": "user", "content": "ping"}], 1000, attempts=1))
+
+    assert len(requests) == 1
+    assert "{invalid-json" not in str(error.value)
+    assert secret not in str(error.value)
+
+
+def test_gemini_retries_a_malformed_response_with_bounded_attempts(monkeypatch):
+    monkeypatch.setenv("MODEL_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+    monkeypatch.setenv("MODEL_NAME", "gemini-2.5-flash")
+    monkeypatch.setenv("MODEL_API_KEY", "dummy-key")
+    responses = iter(
+        (
+            httpx.Response(200, json={"choices": [{"message": {"content": "{bad-json"}}]}),
+            httpx.Response(200, json={"choices": [{"message": {"content": '{"ok":true}'}}]}),
+        )
+    )
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return next(responses)
+
+    _mock_transport(monkeypatch, handler)
+
+    result = asyncio.run(request_model([{"role": "user", "content": "ping"}], 1000, attempts=2))
+
+    assert result == {"ok": True}
+    assert len(requests) == 2
 
 
 def test_model_prompt_keeps_decision_context_and_omits_internal_metadata():

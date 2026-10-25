@@ -33,6 +33,10 @@ class ModelOutputError(RuntimeError):
     pass
 
 
+class ModelMalformedResponse(RuntimeError):
+    pass
+
+
 def _decision_context(dossier):
     return {
         "dossierId": dossier["dossierId"],
@@ -193,6 +197,12 @@ async def request_model(messages, max_output_chars, attempts: int = 3):
             if status not in RETRYABLE_STATUS or attempt == attempts - 1:
                 logger.warning("Model HTTP error status=%s", status)
                 raise
+        except ModelMalformedResponse as exc:
+            last_error = exc
+            if attempt == attempts - 1:
+                logger.warning("Model returned malformed output after retry limit")
+                raise
+            logger.warning("Model returned malformed output; retrying request")
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             last_error = exc
             if attempt == attempts - 1:
@@ -220,11 +230,16 @@ async def _request_once(endpoint, headers, payload, max_output_chars):
         data = json.loads(b"".join(chunks))
         message = data["choices"][0]["message"]
         content = message.get("content")
-        if not isinstance(content, str) or not content or len(content) > max_output_chars:
-            raise ValueError("Invalid model output size")
-        result = json.loads(content, object_pairs_hook=reject_duplicate_keys)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, BadRequest, IndexError) as exc:
-        raise RuntimeError("Model returned malformed output") from exc
+        raise ModelMalformedResponse("Model returned malformed output") from exc
+    if not isinstance(content, str) or not content:
+        raise ModelMalformedResponse("Model returned malformed output")
+    if len(content) > max_output_chars:
+        raise RuntimeError("Model output exceeds size limit")
+    try:
+        result = json.loads(content, object_pairs_hook=reject_duplicate_keys)
+    except (TypeError, ValueError, json.JSONDecodeError, BadRequest) as exc:
+        raise ModelMalformedResponse("Model returned malformed output") from exc
     if not isinstance(result, dict):
-        raise RuntimeError("Model output must be an object")
+        raise ModelMalformedResponse("Model output must be an object")
     return result

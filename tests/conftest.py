@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
 os.environ["DATABASE_SEARCH_PATH"] = "mailroom_agent_ci"
-os.environ.setdefault("MODEL_URL", "https://api.groq.com/openai/v1")
-os.environ.setdefault("MODEL_NAME", "openai/gpt-oss-120b")
+os.environ.setdefault("MODEL_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+os.environ.setdefault("MODEL_NAME", "gemini-2.5-flash")
 
 from tests.helpers import informational_decision
 
@@ -23,8 +23,13 @@ def postgres_configured() -> bool:
     return bool((os.getenv("DATABASE_URL") or "").strip())
 
 
-def groq_configured() -> bool:
-    return bool((os.getenv("MODEL_API_KEY") or "").strip() and (os.getenv("MODEL_URL") or "").strip())
+def gemini_configured() -> bool:
+    return (
+        bool((os.getenv("MODEL_API_KEY") or "").strip())
+        and os.getenv("MODEL_URL", "").rstrip("/")
+        == "https://generativelanguage.googleapis.com/v1beta/openai"
+        and os.getenv("MODEL_NAME", "").strip() == "gemini-2.5-flash"
+    )
 
 
 @pytest.fixture

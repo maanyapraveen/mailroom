@@ -1,8 +1,8 @@
 # Mailroom Agent
 
 Implements the `ga5-mailroom-action-gate/v2` propose/commit HTTP contract.
-The service uses PostgreSQL for durable state and an OpenAI-compatible chat
-completions API for proposals; the supplied `.env.example` targets GroqCloud.
+The service uses PostgreSQL for durable state and Google's OpenAI-compatible
+Gemini Chat Completions API for proposals.
 
 ## Configuration
 
@@ -33,6 +33,13 @@ Copy-Item .env.example .env
 uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
+The default model configuration is Gemini 2.5 Flash. Run one minimal live API
+request without touching PostgreSQL or invoking the assignment endpoints:
+
+```powershell
+python gemini_smoke.py
+```
+
 `GET /healthz` checks application/database readiness. `POST /` accepts JSON
 propose and commit envelopes; unsupported content types return `415`, malformed
 or invalid envelopes return `400`/`422`, and upstream/database failures return
@@ -42,7 +49,7 @@ safe service errors. The OpenAPI documentation endpoints are disabled.
 
 Run the full suite with `python -m pytest -q` after installing
 `requirements-dev.txt`. Unit tests run without external credentials. PostgreSQL
-and GroqCloud integration tests require `DATABASE_URL` and
+and Gemini integration tests require `DATABASE_URL` and
 `MODEL_URL`/`MODEL_NAME`/`MODEL_API_KEY`; without those settings, pytest marks
 the corresponding tests as skipped.
 
