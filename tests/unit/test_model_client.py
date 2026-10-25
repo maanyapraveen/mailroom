@@ -3,7 +3,7 @@ import json
 
 import httpx
 
-from model_client import call_model_batch, model_prompt, request_model
+from model_client import ModelPayloadTooLarge, call_model_batch, model_prompt, request_model
 from tests.helpers import dossier
 
 
@@ -34,6 +34,34 @@ def test_model_retries_rate_limit(monkeypatch):
     result = asyncio.run(request_model([{"role": "user", "content": "hi"}], 1000))
     assert result == {"ok": True}
     assert states["n"] == 2
+
+
+def test_model_payload_too_large_is_not_retried(monkeypatch):
+    monkeypatch.setenv("MODEL_URL", "https://example.test/openai/v1")
+    monkeypatch.setenv("MODEL_NAME", "dummy-model")
+    monkeypatch.setenv("MODEL_API_KEY", "dummy-key")
+    states = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        states["n"] += 1
+        return httpx.Response(413, request=request)
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def wrapper(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", wrapper)
+    try:
+        asyncio.run(request_model([{"role": "user", "content": "too large"}], 1000))
+    except ModelPayloadTooLarge as exc:
+        assert str(exc) == "Model input exceeds provider request limit"
+    else:
+        raise AssertionError("expected a safe payload-size error")
+
+    assert states["n"] == 1
 
 
 def test_model_timeout_exhausted(monkeypatch):
@@ -105,9 +133,7 @@ def test_model_batch_splits_on_payload_too_large(monkeypatch):
         input_dossiers = json.loads(user_content.split("Dossiers:\n", 1)[1])
         batch_sizes.append(len(input_dossiers))
         if len(input_dossiers) > 1:
-            request = httpx.Request("POST", "https://example.test/chat/completions")
-            response = httpx.Response(413, request=request)
-            raise httpx.HTTPStatusError("Payload too large", request=request, response=response)
+            raise ModelPayloadTooLarge("Model input exceeds provider request limit")
         return {
             "decisions": [
                 {
@@ -127,3 +153,24 @@ def test_model_batch_splits_on_payload_too_large(monkeypatch):
     assert batch_sizes == [3, 1, 2, 1, 1]
     assert set(decisions) == {item["dossierId"] for item in items}
     assert all(decisions[item["dossierId"]]["evidence"] == ["l1"] for item in items)
+
+
+def test_model_batch_stops_after_single_dossier_payload_too_large(monkeypatch):
+    items = [dossier(dossier_id=f"dossier-{index}", partition="stable_core") for index in range(3)]
+    batch_sizes = []
+
+    async def fake_request_model(messages, _max_output_chars):
+        input_dossiers = json.loads(messages[1]["content"].split("Dossiers:\n", 1)[1])
+        batch_sizes.append(len(input_dossiers))
+        raise ModelPayloadTooLarge("Model input exceeds provider request limit")
+
+    monkeypatch.setattr("model_client.request_model", fake_request_model)
+
+    try:
+        asyncio.run(call_model_batch(items))
+    except ModelPayloadTooLarge:
+        pass
+    else:
+        raise AssertionError("expected a payload-size error for a single dossier")
+
+    assert batch_sizes == [3, 1]

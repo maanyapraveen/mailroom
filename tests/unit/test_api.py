@@ -198,6 +198,20 @@ def test_healthz(client):
     assert response.json()["status"] == "ok"
 
 
+def test_model_payload_too_large_returns_safe_client_error(client, monkeypatch):
+    from model_client import ModelPayloadTooLarge
+
+    async def oversized_model_request(_dossier):
+        raise ModelPayloadTooLarge("Model input exceeds provider request limit")
+
+    monkeypatch.setattr("main.call_model", oversized_model_request)
+    response = client.post("/", json=propose_body(dossiers=[dossier(partition="fresh_audit")]))
+
+    assert response.status_code == 413
+    assert response.json() == {"error": "Dossier exceeds model provider request limit"}
+    assert "Model input exceeds provider request limit" not in response.text
+
+
 def test_concurrent_propose_and_commit(client):
     key, verifier = make_verifier()
     body = propose_body(verifier=verifier, evaluation_id=new_id("concurrent"))

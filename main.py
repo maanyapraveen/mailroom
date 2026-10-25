@@ -12,7 +12,7 @@ import httpx
 
 from canonical import PROFILE, canonical, make_call_id, sha256
 from db import close_pool, configure, db, init_schema, lock_evaluation
-from model_client import call_model, call_model_batch
+from model_client import ModelPayloadTooLarge, call_model, call_model_batch
 from policy import apply_safety_policy
 from receipts import validate_receipts
 from settings import MAX_BODY, MAX_RESPONSE
@@ -286,6 +286,9 @@ async def endpoint(request: Request):
     except PsycopgError:
         logger.exception("Database failure")
         return error(503, "Storage unavailable")
+    except ModelPayloadTooLarge:
+        logger.warning("Model rejected request because its payload was too large")
+        return error(413, "Dossier exceeds model provider request limit")
     except httpx.TimeoutException:
         logger.warning("Model timeout")
         return error(504, "Model service timeout")

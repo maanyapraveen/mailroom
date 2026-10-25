@@ -24,6 +24,10 @@ Never send unless trusted approval explicitly matches exact recipient, template,
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 
+class ModelPayloadTooLarge(RuntimeError):
+    pass
+
+
 def _decision_context(dossier):
     return {
         "dossierId": dossier["dossierId"],
@@ -82,8 +86,8 @@ async def _request_batch_decisions(dossiers):
             [{"role": "system", "content": SYSTEM_PROMPT}, user_message],
             200000,
         )
-    except httpx.HTTPStatusError as exc:
-        if exc.response is None or exc.response.status_code != 413 or len(dossiers) == 1:
+    except ModelPayloadTooLarge:
+        if len(dossiers) == 1:
             raise
         midpoint = len(dossiers) // 2
         decisions = await _request_batch_decisions(dossiers[:midpoint])
@@ -124,6 +128,8 @@ async def request_model(messages, max_output_chars, attempts: int = 3):
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code if exc.response is not None else 0
             last_error = exc
+            if status == 413:
+                raise ModelPayloadTooLarge("Model input exceeds provider request limit") from exc
             if status not in RETRYABLE_STATUS or attempt == attempts - 1:
                 logger.warning("Model HTTP error status=%s", status)
                 raise
